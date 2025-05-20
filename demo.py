@@ -10,8 +10,7 @@ from urllib.parse import unquote
 import numpy as np
 from keras import Sequential, layers, Model
 from collections import Counter
-from keras.src.layers import Bidirectional, LSTM, Dense, Dropout
-from keras.src.metrics.accuracy_metrics import accuracy
+
 from sklearn.model_selection import train_test_split
 from keras.models import Sequential
 from sklearn.metrics import accuracy_score, confusion_matrix, precision_score, recall_score, f1_score, \
@@ -137,8 +136,8 @@ def read_data():
     df_cds.to_csv("dataset/dataset1/cds_sequences.csv", index=False)
 
     # === Load mapping and expression data ===
-    alias_df = pd.read_csv("dataset/dataset1/geo_files/genes_to_alias_ids.tsv", sep="\t", header=None)
-    tpm_df = pd.read_csv("dataset/dataset1/expression level TPM/abundance.tsv", sep="\t")
+    alias_df = pd.read_csv("dataset/dataset1/alias/genes_to_alias_ids.tsv", sep="\t", header=None)
+    tpm_df = pd.read_csv("dataset/dataset1/geo_file/abundance.tsv", sep="\t")
 
     alias_df.columns = ["e_id", "source", "d_id", "agpv4_id"]
     tpm_df["gene_id"] = tpm_df["target_id"].apply(lambda x: x.split("_T")[0])
@@ -201,7 +200,6 @@ def read_data():
     print("expression_label shape:", np.load('dataset/dataset1/expression_label.npy').shape)
 
 
-#
 # read_data()
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # Force CPU usage
@@ -212,11 +210,13 @@ from tensorflow.keras import layers
 from sklearn.model_selection import train_test_split
 
 # === Load Only First 50 Samples Directly ===
-sequence_data = np.load('dataset/dataset1/sequence_encoded.npy')[:2000, :6000]
-expression_labels = np.load("dataset/dataset1/expression_label.npy")[:2000].astype(int)
-node_features = np.load('dataset/dataset1/other_features.npy',allow_pickle=True)[:20000]  # shape (50, 5)
+sequence_data = np.load('dataset/dataset1/sequence_encoded.npy')[:10, :6000]
+expression_labels = np.load("dataset/dataset1/expression_label.npy")[:10].astype(int)
+node_features = np.load('dataset/dataset1/other_features.npy',allow_pickle=True)[:2000]  # shape (2000, 4)
 
 node_features = np.array(list(node_features)).astype(np.float32)
+
+print("Node features shape:",node_features.shape)
 # # === Create Shared Hypergraph Matrix ===
 # def create_random_hypergraph(num_nodes, num_hyperedges, connection_prob=0.1):
 #     return np.random.rand(num_nodes, num_hyperedges) < connection_prob
@@ -738,28 +738,25 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 import math
 
-
+# Positional Embedding (no parameters saved)
 class PositionalEmbedding(nn.Module):
     def __init__(self, dim, scale=1.0):
         super().__init__()
-        assert dim % 2 == 0
         self.dim = dim
         self.scale = scale
 
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2
-        emb = math.log(10000) / half_dim
+        emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = torch.outer(x * self.scale, emb)
+        emb = torch.outer(torch.arange(x.size(1), device=device).float(), emb)
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
-
-
-def modulate(x, shift, scale):
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        return emb.unsqueeze(0)  # shape (1, L, dim)
 
 
 class LinformerAttention(nn.Module):
@@ -794,283 +791,108 @@ class LinformerAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, seq_len, dim, heads, mlp_dim, k, rate=0.1):
+    def __init__(self, seq_len, dim, heads, mlp_dim, k):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(dim, eps=1e-6)
+        self.ln1 = nn.LayerNorm(dim)
         self.attn = LinformerAttention(seq_len, dim, heads, k)
-        self.ln_2 = nn.LayerNorm(dim, eps=1e-6)
-        self.mlp = nn.Sequential(
+        self.ln2 = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
             nn.Linear(dim, mlp_dim),
             nn.GELU(),
-            nn.Dropout(rate),
-            nn.Linear(mlp_dim, dim),
-            nn.Dropout(rate),
+            nn.Linear(mlp_dim, dim)
         )
-        self.gamma_1 = nn.Linear(dim, dim)
-        self.beta_1 = nn.Linear(dim, dim)
-        self.gamma_2 = nn.Linear(dim, dim)
-        self.beta_2 = nn.Linear(dim, dim)
-        self.scale_1 = nn.Linear(dim, dim)
-        self.scale_2 = nn.Linear(dim, dim)
 
-        self._init_weights([self.gamma_1, self.beta_1, self.gamma_2,
-                            self.beta_2, self.scale_1, self.scale_2])
-
-    def _init_weights(self, layers):
-        for layer in layers:
-            nn.init.zeros_(layer.weight)
-            nn.init.zeros_(layer.bias)
-
-    def forward(self, x, c):
-        scale_msa = self.gamma_1(c)
-        shift_msa = self.beta_1(c)
-        scale_mlp = self.gamma_2(c)
-        shift_mlp = self.beta_2(c)
-        gate_msa = self.scale_1(c).unsqueeze(1)
-        gate_mlp = self.scale_2(c).unsqueeze(1)
-
-        x = self.attn(modulate(self.ln_1(x), shift_msa, scale_msa)) * gate_msa + x
-        x = self.mlp(modulate(self.ln_2(x), shift_mlp, scale_mlp)) * gate_mlp + x
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        x = x + self.ff(self.ln2(x))
         return x
 
 
-class FinalLayer(nn.Module):
-    def __init__(self, dim, out_dim):
-        super().__init__()
-        self.ln_final = nn.LayerNorm(dim, eps=1e-6)
-        self.linear = nn.Linear(dim, out_dim)
-        self.gamma = nn.Linear(dim, dim)
-        self.beta = nn.Linear(dim, dim)
-
-        self._init_weights([self.linear, self.gamma, self.beta])
-
-    def _init_weights(self, layers):
-        for layer in layers:
-            nn.init.zeros_(layer.weight)
-            nn.init.zeros_(layer.bias)
-
-    def forward(self, x, c):
-        scale = self.gamma(c)
-        shift = self.beta(c)
-        x = modulate(self.ln_final(x), shift, scale)
-        return self.linear(x)  # (B, L, out_dim)
-
-
 class DiT1D(nn.Module):
-    def __init__(self, seq_len, dim=128, depth=3, heads=4, mlp_dim=512, k=64, input_dim=4, output_dim=3):
+    def __init__(self, seq_len, dim, depth, heads, mlp_dim, k, input_dim, output_dim):
         super().__init__()
-        self.seq_len = seq_len
-        self.dim = dim
-
         self.embedding = nn.Linear(input_dim, dim)
-        self.pos_embedding = nn.Parameter(torch.randn(1, seq_len, dim))
-
-        self.emb = nn.Sequential(
-            PositionalEmbedding(dim),
-            nn.Linear(dim, dim),
-            nn.SiLU(),
-            nn.Linear(dim, dim),
-        )
-
-        self.transformer = nn.ModuleList([
-            TransformerBlock(seq_len, dim, heads, mlp_dim, k)
-            for _ in range(depth)
+        self.pos_embedding = PositionalEmbedding(dim)
+        self.blocks = nn.Sequential(*[
+            TransformerBlock(seq_len, dim, heads, mlp_dim, k) for _ in range(depth)
         ])
+        self.norm = nn.LayerNorm(dim)
+        self.fc = nn.Linear(dim, output_dim)
 
-        self.final = FinalLayer(dim, output_dim)
-
-    def forward(self, x, t):
-        """
-        x: (B, L, input_dim) - DNA sequence input
-        t: (B,) - time or condition token (e.g., expression context)
-        """
-        x = self.embedding(x) + self.pos_embedding  # (B, L, dim)
-        t = self.emb(t)  # (B, dim)
-
-        for block in self.transformer:
-            x = block(x, t)
-
-        out = self.final(x, t)  # (B, L, output_dim)
-        return out
+    def forward(self, x):
+        x = self.embedding(x)
+        x = x + self.pos_embedding(x)
+        x = self.blocks(x)
+        x = self.norm(x)
+        x = x.mean(dim=1)  # Global average pooling
+        return self.fc(x)
 
 
 
-import torch
+# Simulated input
+sequence_data = sequence_data
+expression_labels = expression_labels
 
+sequence_data_tensor = torch.tensor(sequence_data, dtype=torch.long)
+expression_labels = torch.tensor(expression_labels, dtype=torch.long)
 
-def get_scalings(sig, sig_data):
-    s = sig ** 2 + sig_data ** 2
-    c_skip = sig_data ** 2 / s
-    c_out = sig * sig_data / s.sqrt()
-    c_in = 1 / s.sqrt()
-    return c_skip, c_out, c_in
+# One-hot encode DNA sequences
+x_dna = F.one_hot(sequence_data_tensor, num_classes=5).float()
 
-
-def get_sigmas_karras(n, sigma_min=0.01, sigma_max=80., rho=7., device='cpu'):
-    ramp = torch.linspace(0, 1, n, device=device)
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
-    return torch.cat([sigmas, torch.tensor([0.], device=device)])
-
-
-class Diffusion(object):
-    def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.66):
-        self.P_mean = P_mean
-        self.P_std = P_std
-        self.sigma_data = sigma_data
-
-    def diffuse(self, y):
-        device = y.device
-        # For DNA: y shape = [B, C, L]
-        B = y.shape[0]
-        sigma = torch.exp(torch.randn([B, 1, 1], device=device) * self.P_std + self.P_mean)
-        n = torch.randn_like(y)
-        c_skip, c_out, c_in = get_scalings(sigma, self.sigma_data)
-        noised_input = y + n * sigma
-        target = (y - c_skip * noised_input) / c_out
-        return c_in * noised_input, sigma.view(-1), target
-
-    def sample(self, model, sz, steps=100, sigma_max=80., seed=None):
-        if seed is not None:
-            with torch.random.fork_rng():
-                torch.manual_seed(seed)
-                return self._sample_internal(model, sz, steps, sigma_max)
-        else:
-            return self._sample_internal(model, sz, steps, sigma_max)
-
-    def _sample_internal(self, model, sz, steps, sigma_max):
-        device = next(model.parameters()).device
-        model.eval()
-        x = torch.randn(sz, device=device) * sigma_max
-        t_steps = get_sigmas_karras(steps, device=device, sigma_max=sigma_max)
-
-        for i in range(len(t_steps) - 1):
-            x = self.edm_sampler(x, t_steps, i, model)
-        return x.cpu()
-
-    @torch.no_grad()
-    def edm_sampler(self, x, t_steps, i, model, s_churn=0., s_min=0.,
-                    s_max=float('inf'), s_noise=1.):
-        n = len(t_steps)
-        gamma = self.get_gamma(t_steps[i], s_churn, s_min, s_max, s_noise, n)
-        eps = torch.randn_like(x) * s_noise
-        t_hat = t_steps[i] + gamma * t_steps[i]
-        if gamma > 0:
-            x_hat = x + eps * (t_hat ** 2 - t_steps[i] ** 2).sqrt()
-        else:
-            x_hat = x
-        d = self.get_d(model, x_hat, t_hat)
-        d_cur = (x_hat - d) / t_hat
-        x_next = x_hat + (t_steps[i + 1] - t_hat) * d_cur
-        if t_steps[i + 1] != 0:
-            d = self.get_d(model, x_next, t_steps[i + 1])
-            d_prime = (x_next - d) / t_steps[i + 1]
-            d_prime = (d_cur + d_prime) / 2
-            x_next = x_hat + (t_steps[i + 1] - t_hat) * d_prime
-        return x_next
-
-    def get_d(self, model, x, sig):
-        B = x.shape[0]
-        sig = sig.view(B, 1, 1)  # shape broadcastable to [B, C, L]
-        c_skip, c_out, c_in = get_scalings(sig, self.sigma_data)
-        return model(x * c_in, sig.view(B)) * c_out + x * c_skip
-
-    def get_gamma(self, t_cur, s_churn, s_min, s_max, s_noise, n):
-        if s_min <= t_cur <= s_max:
-            return min(s_churn / (n - 1), 2 ** 0.5 - 1)
-        else:
-            return 0.
-
-
-import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-
-# Ensure x_copy is a tensor of type long
-if isinstance(x_copy, torch.Tensor):
-    x = x_copy.to(torch.long)
-else:
-    x = torch.tensor(x_copy, dtype=torch.long)
-
-# Set the correct number of classes (usually 4 for A, C, G, T; 5 if including padding/unknown)
-num_classes = 5  # Use 5 if values go from 0 to 4 (0:A, 1:C, 2:G, 3:T, 4:padding/unknown)
-
-# One-hot encode the input
-x_dna = F.one_hot(x, num_classes=num_classes).float()  # Shape: (B, L, C)
-
-# Print shape and unique values for debugging
-print("x_dna shape:", x_dna.shape)       # Expected: (20000, 6000, 5)
-print("Unique values in x:", x.unique()) # Values in the original sequence
-print("Unique values in x_dna:", x_dna.unique())  # Should be 0.0 and 1.0 only
-
- # Shape: (20000, 6000, 4)
-
-
-
-print("x shape:", x_dna.shape)  # or x_dna.shape
-print("Unique values in x",x_dna.unique())
-
-from torch.utils.data import Dataset, DataLoader
-
+# Dataset class
 class DNADataset(Dataset):
-    def __init__(self, x_data):
+    def __init__(self, x_data, labels):
         self.x_data = x_data
+        self.labels = labels
 
     def __len__(self):
         return len(self.x_data)
 
     def __getitem__(self, idx):
-        x = self.x_data[idx]
-        if x.ndim == 2:
-            return x  # already (L, C)
-        elif x.ndim == 1:
-            return x.unsqueeze(-1)  # from (L,) → (L, 1)
-        else:
-            raise ValueError(f"Unexpected x shape: {x.shape}")
+        return self.x_data[idx], self.labels[idx]
 
+# DataLoader
+dataset = DNADataset(x_dna, expression_labels)
+dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
 
-dataset = DNADataset(x_dna)
-dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-model = DiT1D(
-    seq_len=x.shape[1],     # 6000
-    dim=128,
-    depth=3,
-    heads=4,
-    mlp_dim=512,
-    k=64,
-    input_dim=x.shape[2],   # 4 (one-hot channels)
-    output_dim=3
-).to(device)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = DiT1D(seq_len=6000, dim=128, depth=2, heads=4, mlp_dim=256,
+              k=64, input_dim=5, output_dim=3).to(device)
 
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+loss_fn = nn.CrossEntropyLoss()
 
-diffusion = Diffusion()
-num_epochs = 10
-model.train()
-for epoch in range(num_epochs):
-    for batch in dataloader:
-        batch = batch.to(device)  # batch shape: [B, L, C]
+# Training Loop
+# Training Loop with Accuracy
+for epoch in range(3):
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
 
-        # Diffuse data: add noise and get target denoising signal
-        x_noisy, sigmas, target = diffusion.diffuse(batch.permute(0, 2, 1))
-        # Note: diffuse expects shape [B, C, L], so permute if needed
-        x_noisy = x_noisy.permute(0, 2, 1)  # back to [B, L, C]
-        target = target.permute(0, 2, 1)
+    for batch_x, batch_y in dataloader:
+        batch_x = batch_x.to(device)
+        batch_y = batch_y.to(device)
 
-        # Forward pass
-        pred = model(x_noisy, sigmas)  # sigmas shape: (B,)
+        pred = model(batch_x)
 
-        # Loss (e.g. MSE between pred and target)
-        loss = nn.MSELoss()(pred, target)
+        # Calculate loss
+        loss = loss_fn(pred, batch_y)
 
-        # Backprop and optimize
+        # Backpropagation
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-    print(f"Epoch {epoch + 1}, Loss: {loss.item():.4f}")
+        # Track total loss
+        total_loss += loss.item()
+
+        # Calculate accuracy
+        predicted_labels = torch.argmax(pred, dim=1)
+        correct += (predicted_labels == batch_y).sum().item()
+        total += batch_y.size(0)
+
+    avg_loss = total_loss / len(dataloader)
+    accuracy = correct / total * 100
+
+    print(f"Epoch {epoch+1}, Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%")
